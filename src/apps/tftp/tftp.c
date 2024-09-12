@@ -82,9 +82,8 @@ struct tftp_state {
   const struct tftp_context *ctx;
   void *handle;
   struct pbuf *last_data;
-  struct udp_pcb *upcb;
-  ip_addr_t addr;
-  u16_t port;
+  struct udp_pcb *ctrl_upcb;
+  struct udp_pcb *data_upcb;
   int timer;
   int last_pkt;
   u16_t blknum;
@@ -100,15 +99,13 @@ static void tftp_tmr(void *arg);
 static void
 close_handle(void)
 {
-  tftp_state.port = 0;
-  ip_addr_set_any(0, &tftp_state.addr);
-
   if (tftp_state.last_data != NULL) {
     pbuf_free(tftp_state.last_data);
     tftp_state.last_data = NULL;
   }
 
   sys_untimeout(tftp_tmr, NULL);
+  udp_disconnect(tftp_state.data_upcb);
 
   if (tftp_state.handle) {
     tftp_state.ctx->close(tftp_state.handle);
@@ -149,15 +146,16 @@ send_request(const ip_addr_t *addr, u16_t port, u16_t opcode, const char* fname,
   MEMCPY(payload+2,              fname, fname_length);
   MEMCPY(payload+2+fname_length, mode,  mode_length);
 
-  ret = udp_sendto(tftp_state.upcb, p, addr, port);
+  ret = udp_sendto(tftp_state.data_upcb, p, addr, port);
+  ret = ERR_OK;
   pbuf_free(p);
   return ret;
 }
 
 static err_t
-send_error(const ip_addr_t *addr, u16_t port, enum tftp_error code, const char *str)
+send_error(struct udp_pcb *upcb, enum tftp_error code, const char *str)
 {
-  size_t str_length = strlen(str);
+  int str_length = strlen(str);
   struct pbuf *p;
   u16_t *payload;
   err_t ret;
@@ -170,13 +168,13 @@ send_error(const ip_addr_t *addr, u16_t port, enum tftp_error code, const char *
   payload = (u16_t *) p->payload;
   MEMCPY(&payload[2], str, str_length + 1);
 
-  ret = udp_sendto(tftp_state.upcb, p, addr, port);
+  ret = udp_send(upcb, p);
   pbuf_free(p);
   return ret;
 }
 
 static err_t
-send_ack(const ip_addr_t *addr, u16_t port, u16_t blknum)
+send_ack(u16_t blknum)
 {
   struct pbuf *p;
   err_t ret;
@@ -186,13 +184,13 @@ send_ack(const ip_addr_t *addr, u16_t port, u16_t blknum)
     return ERR_MEM;
   }
 
-  ret = udp_sendto(tftp_state.upcb, p, addr, port);
+  ret = udp_send(tftp_state.data_upcb, p);
   pbuf_free(p);
   return ret;
 }
 
 static err_t
-resend_data(const ip_addr_t *addr, u16_t port)
+resend_data()
 {
   err_t ret;
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, tftp_state.last_data->len, PBUF_RAM);
@@ -206,13 +204,13 @@ resend_data(const ip_addr_t *addr, u16_t port)
     return ret;
   }
 
-  ret = udp_sendto(tftp_state.upcb, p, addr, port);
+  ret = udp_send(tftp_state.data_upcb, p);
   pbuf_free(p);
   return ret;
 }
 
 static void
-send_data(const ip_addr_t *addr, u16_t port)
+send_data()
 {
   u16_t *payload;
   int ret;
@@ -230,13 +228,13 @@ send_data(const ip_addr_t *addr, u16_t port)
 
   ret = tftp_state.ctx->read(tftp_state.handle, &payload[2], TFTP_MAX_PAYLOAD_SIZE);
   if (ret < 0) {
-    send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Error occurred while reading the file.");
+    send_error(tftp_state.data_upcb, TFTP_ERROR_ACCESS_VIOLATION, "Error occurred while reading the file.");
     close_handle();
     return;
   }
 
   pbuf_realloc(tftp_state.last_data, (u16_t)(TFTP_HEADER_LENGTH + ret));
-  resend_data(addr, port);
+  resend_data();
 }
 
 static void
@@ -248,17 +246,16 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
   LWIP_UNUSED_ARG(arg);
   LWIP_UNUSED_ARG(upcb);
 
-  if (((tftp_state.port != 0) && (port != tftp_state.port)) ||
-      (!ip_addr_isany_val(tftp_state.addr) && !ip_addr_eq(&tftp_state.addr, addr))) {
-    send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Only one connection at a time is supported");
-    pbuf_free(p);
-    return;
-  }
-
   opcode = sbuf[0];
 
   tftp_state.last_pkt = tftp_state.timer;
   tftp_state.retries = 0;
+
+  if (upcb == tftp_state.ctrl_upcb)
+  {
+    // Temporary connect the control pcb to the remote end. This facilitates sending errors etc
+    udp_connect(upcb, addr, port);
+  }
 
   switch (opcode) {
     case PP_HTONS(TFTP_RRQ): /* fall through */
@@ -269,13 +266,24 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       u16_t filename_end_offset;
       u16_t mode_end_offset;
 
+      if (upcb != tftp_state.ctrl_upcb) {
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Opcode not allowed on data connection");
+        break;
+      }
+
+      if ((tftp_state.data_upcb->remote_port != 0) && (port == tftp_state.data_upcb->remote_port) &&
+          (!ip_addr_isany_val(tftp_state.data_upcb->remote_ip) && ip_addr_eq(&tftp_state.data_upcb->remote_ip, addr))) {
+        // Resend of previous request. Ignore
+        return;
+      }
+
       if (tftp_state.handle != NULL) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Only one connection at a time is supported");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Only one connection at a time is supported");
         break;
       }
 
       if ((tftp_state.tftp_mode & LWIP_TFTP_MODE_SERVER) == 0) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "TFTP server not enabled");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "TFTP server not enabled");
         break;
       }
 
@@ -284,7 +292,7 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       /* find \0 in pbuf -> end of filename string */
       filename_end_offset = pbuf_memfind(p, &tftp_null, sizeof(tftp_null), 2);
       if ((u16_t)(filename_end_offset - 1) > sizeof(filename)) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Filename too long/not NULL terminated");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Filename too long/not NULL terminated");
         break;
       }
       pbuf_copy_partial(p, filename, filename_end_offset - 1, 2);
@@ -292,7 +300,7 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       /* find \0 in pbuf -> end of mode string */
       mode_end_offset = pbuf_memfind(p, &tftp_null, sizeof(tftp_null), filename_end_offset + 1);
       if ((u16_t)(mode_end_offset - filename_end_offset) > sizeof(mode)) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Mode too long/not NULL terminated");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Mode too long/not NULL terminated");
         break;
       }
       pbuf_copy_partial(p, mode, mode_end_offset - filename_end_offset, filename_end_offset + 1);
@@ -301,7 +309,7 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       tftp_state.blknum = 1;
 
       if (!tftp_state.handle) {
-        send_error(addr, port, TFTP_ERROR_FILE_NOT_FOUND, "Unable to open requested file.");
+        send_error(upcb, TFTP_ERROR_FILE_NOT_FOUND, "Unable to open requested file.");
         break;
       }
 
@@ -309,15 +317,14 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       ip_addr_debug_print(TFTP_DEBUG | LWIP_DBG_STATE, addr);
       LWIP_DEBUGF(TFTP_DEBUG | LWIP_DBG_STATE, (" for '%s' mode '%s'\n", filename, mode));
 
-      ip_addr_copy(tftp_state.addr, *addr);
-      tftp_state.port = port;
+      udp_connect(tftp_state.data_upcb, addr, port);
 
       if (opcode == PP_HTONS(TFTP_WRQ)) {
         tftp_state.mode_write = 1;
-        send_ack(addr, port, 0);
+        send_ack(0);
       } else {
         tftp_state.mode_write = 0;
-        send_data(addr, port);
+        send_data();
       }
 
       break;
@@ -327,13 +334,13 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       int ret;
       u16_t blknum;
 
-      if (tftp_state.handle == NULL) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "No connection");
+      if (tftp_state.handle == NULL || upcb != tftp_state.data_upcb) {
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "No connection");
         break;
       }
 
       if (tftp_state.mode_write != 1) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Not a write connection");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Not a write connection");
         break;
       }
 
@@ -343,10 +350,10 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
 
         ret = tftp_state.ctx->write(tftp_state.handle, p);
         if (ret < 0) {
-          send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "error writing file");
+          send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "error writing file");
           close_handle();
         } else {
-          send_ack(addr, port, blknum);
+          send_ack(blknum);
         }
 
         if (p->tot_len < TFTP_MAX_PAYLOAD_SIZE) {
@@ -356,9 +363,9 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
         }
       } else if ((u16_t)(blknum + 1) == tftp_state.blknum) {
         /* retransmit of previous block, ack again (casting to u16_t to care for overflow) */
-        send_ack(addr, port, blknum);
+        send_ack(blknum);
       } else {
-        send_error(addr, port, TFTP_ERROR_UNKNOWN_TRFR_ID, "Wrong block number");
+        send_error(upcb, TFTP_ERROR_UNKNOWN_TRFR_ID, "Wrong block number");
       }
       break;
     }
@@ -368,18 +375,18 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       int lastpkt;
 
       if (tftp_state.handle == NULL) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "No connection");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "No connection");
         break;
       }
 
       if (tftp_state.mode_write != 0) {
-        send_error(addr, port, TFTP_ERROR_ACCESS_VIOLATION, "Not a read connection");
+        send_error(upcb, TFTP_ERROR_ACCESS_VIOLATION, "Not a read connection");
         break;
       }
 
       blknum = lwip_ntohs(sbuf[1]);
       if (blknum != tftp_state.blknum) {
-        send_error(addr, port, TFTP_ERROR_UNKNOWN_TRFR_ID, "Wrong block number");
+        send_error(upcb, TFTP_ERROR_UNKNOWN_TRFR_ID, "Wrong block number");
         break;
       }
 
@@ -406,8 +413,13 @@ tftp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *p, const ip_addr_t *addr
       }
       break;
     default:
-      send_error(addr, port, TFTP_ERROR_ILLEGAL_OPERATION, "Unknown operation");
+      send_error(upcb, TFTP_ERROR_ILLEGAL_OPERATION, "Unknown operation");
       break;
+  }
+
+  if (upcb == tftp_state.ctrl_upcb)
+  {
+    udp_disconnect(upcb);
   }
 
   pbuf_free(p);
@@ -429,7 +441,7 @@ tftp_tmr(void *arg)
   if ((tftp_state.timer - tftp_state.last_pkt) > (TFTP_TIMEOUT_MSECS / TFTP_TIMER_MSECS)) {
     if ((tftp_state.last_data != NULL) && (tftp_state.retries < TFTP_MAX_RETRIES)) {
       LWIP_DEBUGF(TFTP_DEBUG | LWIP_DBG_STATE, ("tftp: timeout, retrying\n"));
-      resend_data(&tftp_state.addr, tftp_state.port);
+      resend_data();
       tftp_state.retries++;
     } else {
       LWIP_DEBUGF(TFTP_DEBUG | LWIP_DBG_STATE, ("tftp: timeout\n"));
@@ -449,26 +461,34 @@ tftp_init_common(u8_t mode, const struct tftp_context *ctx)
   err_t ret;
 
   /* LWIP_ASSERT_CORE_LOCKED(); is checked by udp_new() */
-  struct udp_pcb *pcb = udp_new_ip_type(IPADDR_TYPE_ANY);
-  if (pcb == NULL) {
+  struct udp_pcb *ctrl_upcb = udp_new_ip_type(IPADDR_TYPE_ANY);
+  if (ctrl_upcb == NULL) {
     return ERR_MEM;
   }
 
-  ret = udp_bind(pcb, IP_ANY_TYPE, TFTP_PORT);
+  ret = udp_bind(ctrl_upcb, IP_ANY_TYPE, TFTP_PORT);
   if (ret != ERR_OK) {
-    udp_remove(pcb);
+    udp_remove(ctrl_upcb);
     return ret;
   }
 
+  struct udp_pcb *data_upcb = udp_new_ip_type(IPADDR_TYPE_ANY);
+  if (data_upcb == NULL) {
+    return ERR_MEM;
+  }
+
   tftp_state.handle    = NULL;
-  tftp_state.port      = 0;
   tftp_state.ctx       = ctx;
   tftp_state.timer     = 0;
   tftp_state.last_data = NULL;
-  tftp_state.upcb      = pcb;
+  tftp_state.ctrl_upcb = ctrl_upcb;
+  tftp_state.data_upcb = data_upcb;
   tftp_state.tftp_mode = mode;
 
-  udp_recv(pcb, tftp_recv, NULL);
+  udp_recv(ctrl_upcb, tftp_recv, NULL);
+  if (mode == LWIP_TFTP_MODE_SERVER) {
+    udp_recv(data_upcb, tftp_recv, NULL);
+  }
 
   return ERR_OK;
 }
@@ -498,8 +518,9 @@ tftp_init_client(const struct tftp_context *ctx)
  */
 void tftp_cleanup(void)
 {
-  LWIP_ASSERT("Cleanup called on non-initialized TFTP", tftp_state.upcb != NULL);
-  udp_remove(tftp_state.upcb);
+  LWIP_ASSERT("Cleanup called on non-initialized TFTP", tftp_state.ctrl_upcb != NULL);
+  udp_remove(tftp_state.ctrl_upcb);
+  udp_remove(tftp_state.data_upcb);
   close_handle();
   memset(&tftp_state, 0, sizeof(tftp_state));
 }
